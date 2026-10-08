@@ -1,1 +1,15 @@
-
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NAKSHATRA INDEX v1</title><link rel="stylesheet" href="/static/style.css?v=1"></head><body>
+<header><div><h1>✦ NAKSHATRA INDEX v1</h1><small>Kotak Neo • Technical • Futures • Options • AI • Astrology</small></div><div id="status">● KOTAK LIVE</div></header>
+<main>
+<section class="markets">{% for s,n in [('NIFTY50','NIFTY 50'),('BANKNIFTY','BANKNIFTY'),('NIFTYIT','NIFTY IT'),('SENSEX','SENSEX')] %}<button class="symbol{% if s=='NIFTY50' %} active{% endif %}" data-symbol="{{s}}">{{n}}</button>{% endfor %}</section>
+<section class="live"><div class="eyebrow">LIVE MARKET</div><h2 id="name">NIFTY 50</h2><div class="price" id="price">—</div><div id="change">—</div><div class="grid"><div>DAY HIGH<strong id="high">—</strong></div><div>DAY LOW<strong id="low">—</strong></div><div>VOLUME<strong id="volume">—</strong></div><div>DATA<strong id="liveState">Loading…</strong></div></div></section>
+<section class="decision"><h2>🧠 NAKSHATRA AI DECISION</h2><div class="big" id="decision">WAIT</div><div>Strength <span id="strength">—</span>/100</div><div id="agreement">Loading…</div></section>
+<section><h2>📊 Technical / MTF</h2><div id="technical" class="cards">Loading…</div></section>
+<section><h2>📈 Futures Intelligence</h2><div id="futures" class="cards">Loading…</div></section>
+<section><h2>⚖️ Futures × Options Decision</h2><div id="fo" class="cards">Loading…</div></section>
+<section><h2>📊 Option Chain — Top 5 OI</h2><div id="options">Loading…</div></section>
+<section><h2>🌙 Astrology</h2><div id="astrology">Loading…</div></section>
+<section><h2>🔢 Numerology</h2><div id="numerology">Loading…</div></section>
+<section><h2>💬 Sentiment</h2><div id="sentiment">Loading…</div></section>
+<section><h2>📡 Live Scanner</h2><div id="scanner">Loading…</div></section>
+</main><script src="/static/app.js?v=1"></script></body></html>
