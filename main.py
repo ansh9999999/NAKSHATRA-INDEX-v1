@@ -102,7 +102,8 @@ app.mount("/static",StaticFiles(directory="static"),name="static")
 templates=Jinja2Templates(directory="templates")
 
 @app.get("/",response_class=HTMLResponse)
-def home(request:Request):return templates.TemplateResponse("dashboard.html",{"request":request})
+def home(request: Request):
+    return templates.TemplateResponse(request=request, name="dashboard.html", context={"request": request})
 @app.get("/health")
 def health():return {"status":"OK","service":"nakshatra-index","markets":symbols(),"scheduler":"disabled"}
 @app.get("/api/quote")
