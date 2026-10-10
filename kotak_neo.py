@@ -401,21 +401,22 @@ def _search_scrip_master(client, market):
 
     for url in urls:
         try:
-            df = pd.read_csv(url, low_memory=False)
-
-            if df.empty:
-                continue
-
+            # IMPORTANT: instrument masters can contain hundreds of thousands of rows.
+            # Loading the entire CSV with read_csv(url) can spike RAM above Render Free's
+            # 512 MB limit. Process small chunks and retain only matching instruments.
             records = []
-
-            for _, row in df.iterrows():
-                raw = {str(k): row[k] for k in df.columns}
-                normal = _normalise_record(raw)
-
-                if normal["instrument_token"] is None:
+            for df in pd.read_csv(url, low_memory=False, chunksize=5000):
+                if df.empty:
                     continue
 
-                if _looks_like_symbol(raw, candidates):
+                for _, row in df.iterrows():
+                    raw = {str(k): row[k] for k in df.columns}
+                    if not _looks_like_symbol(raw, candidates):
+                        continue
+
+                    normal = _normalise_record(raw)
+                    if normal["instrument_token"] is None:
+                        continue
                     records.append(normal)
 
             if records:
