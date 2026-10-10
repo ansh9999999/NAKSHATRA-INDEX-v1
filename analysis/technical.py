@@ -9,7 +9,7 @@ def num(v, default=0.0):
         return default
 
 def _tf(df):
-    if df is None or df.empty or len(df)<20: return {"trend":"NO DATA","score":0,"rsi":None,"ema9":None,"ema20":None}
+    if df is None or df.empty or len(df)<20: return {"trend":"NO DATA","score":0,"rsi":None,"ema9":None,"ema20":None,"atr":None}
     c=df["close"].astype(float); e9=c.ewm(span=9,adjust=False).mean(); e20=c.ewm(span=20,adjust=False).mean()
     d=c.diff(); gain=d.clip(lower=0).rolling(14).mean(); loss=(-d.clip(upper=0)).rolling(14).mean(); rs=gain/loss.replace(0,pd.NA); rsi=(100-(100/(1+rs))).fillna(50)
     last=float(c.iloc[-1]); a=float(e9.iloc[-1]); b=float(e20.iloc[-1]); r=float(rsi.iloc[-1])
@@ -21,7 +21,14 @@ def _tf(df):
     if len(c)>=2 and float(c.iloc[-1])>float(c.iloc[-2]): score+=10
     else: score-=10
     trend="BULLISH" if score>=25 else "BEARISH" if score<=-25 else "SIDEWAYS"
-    return {"trend":trend,"score":score,"price":last,"ema9":round(a,2),"ema20":round(b,2),"rsi":round(r,2)}
+    atr_value = None
+    try:
+        high=df["high"].astype(float); low=df["low"].astype(float); prev=c.shift(1)
+        tr=pd.concat([(high-low).abs(),(high-prev).abs(),(low-prev).abs()],axis=1).max(axis=1)
+        av=tr.rolling(14,min_periods=1).mean().iloc[-1]
+        if math.isfinite(float(av)) and float(av)>0: atr_value=round(float(av),2)
+    except Exception: pass
+    return {"trend":trend,"score":score,"price":last,"ema9":round(a,2),"ema20":round(b,2),"rsi":round(r,2),"atr":atr_value}
 
 def analyze(data):
     out={}; scores=[]
