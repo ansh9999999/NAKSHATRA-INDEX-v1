@@ -24,7 +24,7 @@ from option_chain import analyze as option_analyze
 # analysis pipelines from running in parallel and exhausting memory.
 EXECUTOR=ThreadPoolExecutor(max_workers=1)
 HISTORY_EXECUTOR=ThreadPoolExecutor(max_workers=1)
-AUX_EXECUTOR=ThreadPoolExecutor(max_workers=2)
+AUX_EXECUTOR=ThreadPoolExecutor(max_workers=1)
 LOCK=threading.Lock()
 QUOTE_CACHE={}; ANALYSIS_CACHE={}; JOBS=set(); MAX_CACHE=4
 QUOTE_TTL=8; ANALYSIS_TTL=45
