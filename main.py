@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 import math, threading, time
 import requests
@@ -19,9 +19,14 @@ from analysis.astrology_engine import analyze_astrology
 from analysis.numerology_engine import analyze_numerology
 from option_chain import analyze as option_analyze
 
-EXECUTOR=ThreadPoolExecutor(max_workers=2)
+# Render Free has only 512 MB RAM. Keep background concurrency deliberately low.
+# Analysis jobs are single-flight per symbol; one worker prevents several pandas/Kotak
+# analysis pipelines from running in parallel and exhausting memory.
+EXECUTOR=ThreadPoolExecutor(max_workers=1)
+HISTORY_EXECUTOR=ThreadPoolExecutor(max_workers=1)
+AUX_EXECUTOR=ThreadPoolExecutor(max_workers=2)
 LOCK=threading.Lock()
-QUOTE_CACHE={}; ANALYSIS_CACHE={}; JOBS=set(); MAX_CACHE=8
+QUOTE_CACHE={}; ANALYSIS_CACHE={}; JOBS=set(); MAX_CACHE=4
 QUOTE_TTL=8; ANALYSIS_TTL=45
 
 def safe(v):
@@ -50,29 +55,80 @@ def quote(symbol, force=False):
     with LOCK: bounded_put(QUOTE_CACHE,s,(time.time(),out))
     return out
 
+def _empty_history():
+    return {tf: None for tf in ("5m", "15m", "1h", "1d")}
+
+
+def _limited_result(pool, fn, args, timeout, label, fallback):
+    """Run a slow provider call without letting it hold the full dashboard analysis."""
+    future = pool.submit(fn, *args)
+    try:
+        return future.result(timeout=timeout)
+    except FuturesTimeoutError:
+        logger.warning("ANALYSIS STAGE TIMEOUT stage=%s timeout=%ss", label, timeout)
+    except Exception:
+        logger.exception("ANALYSIS STAGE FAILED stage=%s", label)
+    return fallback
+
+
 def build_analysis(symbol):
     s=canonical_symbol(symbol)
+    now=datetime.now()
+    errors=[]
+
+    # Historical calls are sequential/rate-limited. Bound their wait so one
+    # delayed Kotak response cannot keep every dashboard card on Loading forever.
+    data=_limited_result(
+        HISTORY_EXECUTOR, get_multi_timeframe_history, (s, 220), 18,
+        "history", _empty_history(),
+    )
+    if not isinstance(data, dict):
+        data=_empty_history()
+        errors.append("history unavailable")
+
     try:
-        data=get_multi_timeframe_history(s,limit=220)
         tech=technical_analyze(data)
-        q=quote(s).get("price")
-        spot=float(q) if q else next((x.get("price") for x in tech["timeframes"].values() if x.get("price")),0)
-        oc=option_analyze(s,spot)
-        fut=get_futures_intelligence(s,spot)
-        ast=analyze_astrology(datetime.now())
-        num=analyze_numerology(datetime.now(),s)
-        dirs=[tech.get("direction"), oc.get("signal")]
-        if fut.get("buildup") in ("LONG BUILDUP","SHORT COVERING"): dirs.append("BUY")
-        elif fut.get("buildup") in ("SHORT BUILDUP","LONG UNWINDING"): dirs.append("SELL")
-        bullish=sum(1 for d in dirs if str(d).upper() in ("BUY","BULLISH")); bearish=sum(1 for d in dirs if str(d).upper() in ("SELL","BEARISH"))
-        if bullish>bearish and bullish>=2: decision="BUY"
-        elif bearish>bullish and bearish>=2: decision="SELL"
-        else: decision="WAIT"
-        sentiment="BULLISH" if bullish>bearish else "BEARISH" if bearish>bullish else "NEUTRAL"
-        return safe({"status":"OK","symbol":s,"technical":tech,"futures":fut,"options":oc,"futures_options":combine_futures_options(fut,oc),"astrology":ast,"numerology":num,"sentiment":{"status":"OK","bias":sentiment,"technical":tech.get("direction"),"options":oc.get("signal"),"futures":fut.get("buildup")},"decision":{"action":decision,"strength":min(100,50+abs(bullish-bearish)*15),"agreement":"CONFIRMED" if (bullish>=2 or bearish>=2) else "NO AGREEMENT"}})
-    except Exception as e:
-        logger.exception("INDEX ANALYSIS ERROR %s",s)
-        return {"status":"ERROR","symbol":s,"message":str(e)}
+    except Exception as exc:
+        logger.exception("ANALYSIS STAGE FAILED stage=technical symbol=%s", s)
+        tech={"status":"ERROR","direction":"WAIT","score":0,"timeframes":{}}
+        errors.append("technical unavailable")
+
+    qdata=_limited_result(AUX_EXECUTOR, quote, (s,), 4, "quote", {}) or {}
+    q=qdata.get("price") if isinstance(qdata,dict) else None
+    spot=float(q) if q else next((x.get("price") for x in (tech.get("timeframes") or {}).values() if x.get("price")),0)
+
+    # Option-chain and futures calls run independently. A slow/unsupported
+    # provider call becomes PARTIAL data instead of blocking astrology and AI.
+    oc=_limited_result(AUX_EXECUTOR, option_analyze, (s,spot), 5, "option_chain",
+        {"status":"NO DATA","symbol":s,"rows":[],"row_count":0,"reason":"Option-chain request timed out."})
+    fut=_limited_result(AUX_EXECUTOR, get_futures_intelligence, (s,spot), 5, "futures",
+        {"status":"NO DATA","symbol":s,"reason":"Futures quote request timed out."})
+
+    try: ast=analyze_astrology(now)
+    except Exception:
+        logger.exception("ANALYSIS STAGE FAILED stage=astrology symbol=%s",s)
+        ast={"status":"ERROR","bias":"UNAVAILABLE"}; errors.append("astrology unavailable")
+    try: num=analyze_numerology(now,s)
+    except Exception:
+        logger.exception("ANALYSIS STAGE FAILED stage=numerology symbol=%s",s)
+        num={"status":"ERROR","bias":"UNAVAILABLE"}; errors.append("numerology unavailable")
+
+    dirs=[tech.get("direction"), oc.get("signal")]
+    if fut.get("buildup") in ("LONG BUILDUP", "SHORT COVERING"): dirs.append("BUY")
+    elif fut.get("buildup") in ("SHORT BUILDUP", "LONG UNWINDING"): dirs.append("SELL")
+    bullish=sum(1 for d in dirs if str(d).upper() in ("BUY","BULLISH"))
+    bearish=sum(1 for d in dirs if str(d).upper() in ("SELL","BEARISH"))
+    if bullish>bearish and bullish>=2: decision="BUY"
+    elif bearish>bullish and bearish>=2: decision="SELL"
+    else: decision="WAIT"
+    sentiment="BULLISH" if bullish>bearish else "BEARISH" if bearish>bullish else "NEUTRAL"
+    partial=bool(errors) or tech.get("status")!="OK" or oc.get("status")!="OK" or fut.get("status")!="OK"
+    result={"status":"PARTIAL" if partial else "OK","symbol":s,"technical":tech,"futures":fut,"options":oc,
+        "futures_options":combine_futures_options(fut,oc),"astrology":ast,"numerology":num,
+        "sentiment":{"status":"OK","bias":sentiment,"technical":tech.get("direction"),"options":oc.get("signal"),"futures":fut.get("buildup")},
+        "decision":{"action":decision,"strength":min(100,50+abs(bullish-bearish)*15),"agreement":"CONFIRMED" if (bullish>=2 or bearish>=2) else "NO AGREEMENT"},
+        "message":"Partial data: " + ", ".join(errors) if errors else None,"updated_at":time.time()}
+    return safe(result)
 
 def ensure_analysis(symbol, force=False):
     s=canonical_symbol(symbol); now=time.time()
@@ -96,14 +152,15 @@ async def lifespan(app):
     logger.info("NAKSHATRA INDEX v1 started — scheduler/scanner disabled")
     yield
     EXECUTOR.shutdown(wait=False,cancel_futures=True)
+    HISTORY_EXECUTOR.shutdown(wait=False,cancel_futures=True)
+    AUX_EXECUTOR.shutdown(wait=False,cancel_futures=True)
 
 app=FastAPI(title="NAKSHATRA INDEX v1",version="1.0",lifespan=lifespan)
 app.mount("/static",StaticFiles(directory="static"),name="static")
 templates=Jinja2Templates(directory="templates")
 
 @app.get("/",response_class=HTMLResponse)
-def home(request: Request):
-    return templates.TemplateResponse(request=request, name="dashboard.html", context={"request": request})
+def home(request:Request):return templates.TemplateResponse(request=request, name="dashboard.html", context={"request":request})
 @app.get("/health")
 def health():return {"status":"OK","service":"nakshatra-index","markets":symbols(),"scheduler":"disabled"}
 @app.get("/api/quote")
