@@ -27,7 +27,8 @@ HISTORY_EXECUTOR=ThreadPoolExecutor(max_workers=1)
 AUX_EXECUTOR=ThreadPoolExecutor(max_workers=1)
 LOCK=threading.Lock()
 QUOTE_CACHE={}; ANALYSIS_CACHE={}; JOBS=set(); MAX_CACHE=4
-QUOTE_TTL=8; ANALYSIS_TTL=45
+QUOTE_TTL=15; ANALYSIS_TTL=90
+_STAGE_LOCK=threading.Lock(); _STAGE_FUTURES={}
 
 def safe(v):
     if v is None or isinstance(v,(str,bool,int)): return v
@@ -61,13 +62,25 @@ def _empty_history():
 
 def _limited_result(pool, fn, args, timeout, label, fallback):
     """Run a slow provider call without letting it hold the full dashboard analysis."""
-    future = pool.submit(fn, *args)
+    # Never enqueue repeated timed-out work behind a stuck provider request.
+    with _STAGE_LOCK:
+        old = _STAGE_FUTURES.get(label)
+        if old is not None and not old.done():
+            logger.warning("ANALYSIS STAGE SKIP stage=%s reason=previous_call_still_running", label)
+            return fallback
+        future = pool.submit(fn, *args)
+        _STAGE_FUTURES[label] = future
     try:
-        return future.result(timeout=timeout)
+        result = future.result(timeout=timeout)
+        return result
     except FuturesTimeoutError:
         logger.warning("ANALYSIS STAGE TIMEOUT stage=%s timeout=%ss", label, timeout)
     except Exception:
         logger.exception("ANALYSIS STAGE FAILED stage=%s", label)
+    finally:
+        with _STAGE_LOCK:
+            if _STAGE_FUTURES.get(label) is future and future.done():
+                _STAGE_FUTURES.pop(label, None)
     return fallback
 
 
@@ -113,20 +126,49 @@ def build_analysis(symbol):
         logger.exception("ANALYSIS STAGE FAILED stage=numerology symbol=%s",s)
         num={"status":"ERROR","bias":"UNAVAILABLE"}; errors.append("numerology unavailable")
 
-    dirs=[tech.get("direction"), oc.get("signal")]
-    if fut.get("buildup") in ("LONG BUILDUP", "SHORT COVERING"): dirs.append("BUY")
-    elif fut.get("buildup") in ("SHORT BUILDUP", "LONG UNWINDING"): dirs.append("SELL")
-    bullish=sum(1 for d in dirs if str(d).upper() in ("BUY","BULLISH"))
-    bearish=sum(1 for d in dirs if str(d).upper() in ("SELL","BEARISH"))
-    if bullish>bearish and bullish>=2: decision="BUY"
-    elif bearish>bullish and bearish>=2: decision="SELL"
-    else: decision="WAIT"
-    sentiment="BULLISH" if bullish>bearish else "BEARISH" if bearish>bullish else "NEUTRAL"
+    # Weighted agreement, following the v3.5 model: Technical 50%, Options 20%,
+    # Astrology 15%, Numerology 15%. Missing inputs are excluded and weights renormalized.
+    components=[]
+    tscore=tech.get("score")
+    if isinstance(tscore,(int,float)) and tech.get("status")=="OK": components.append((0.50,max(-100,min(100,float(tscore)))))
+    osig=str(oc.get("signal") or "").upper()
+    if oc.get("status")=="OK": components.append((0.20,100 if osig in ("BULLISH","BUY") else -100 if osig in ("BEARISH","SELL") else 0))
+    abias=str(ast.get("bias") or "").upper()
+    if abias in ("BULLISH","BEARISH","NEUTRAL"):
+        av=float(ast.get("score",50)); components.append((0.15,max(-100,min(100,(av-50)*2))))
+    nbias=str(num.get("bias") or "").upper()
+    if nbias in ("BUY","SELL","NEUTRAL"):
+        nv=float(num.get("score",50)); components.append((0.15,max(-100,min(100,(nv-50)*2))))
+    total_weight=sum(w for w,_ in components)
+    combined_score=(sum(w*v for w,v in components)/total_weight) if total_weight else 0
+    decision="BUY" if combined_score>=20 else "SELL" if combined_score<=-20 else "WAIT"
+    strength=round(min(95,abs(combined_score))) if components else 0
+    sentiment="BULLISH" if combined_score>=15 else "BEARISH" if combined_score<=-15 else "NEUTRAL"
     partial=bool(errors) or tech.get("status")!="OK" or oc.get("status")!="OK" or fut.get("status")!="OK"
+    tf5=(tech.get("timeframes") or {}).get("5m",{})
+    entry=float(q) if q else float(tf5.get("price") or 0)
+    atr=float(tf5.get("atr") or 0)
+    trade_plan={"status":"WAIT","action":"WAIT","reason":"Signals do not have enough agreement for a trade."}
+    if decision in ("BUY","SELL") and entry>0 and atr>0:
+        risk=atr*1.5; reward1=atr*2.0; reward2=atr*3.0; reward3=atr*4.0
+        trade_plan={"status":"READY","action":decision,"entry":round(entry,2),
+            "stop_loss":round(entry-risk if decision=="BUY" else entry+risk,2),
+            "target1":round(entry+reward1 if decision=="BUY" else entry-reward1,2),
+            "target2":round(entry+reward2 if decision=="BUY" else entry-reward2,2),
+            "target3":round(entry+reward3 if decision=="BUY" else entry-reward3,2),
+            "risk_reward":round(reward1/risk,2) if risk else None,"atr":round(atr,2),
+            "invalidation":"Price crosses stop-loss; reassess before any re-entry.",
+            "reason":"ATR-based illustrative levels; confirm liquidity and position size before trading."}
+    why=[]
+    if tech.get("direction"): why.append("Technical: "+str(tech.get("direction")))
+    if oc.get("signal"): why.append("Options: "+str(oc.get("signal")))
+    if abias: why.append("Astrology: "+abias+" (context only)")
+    if nbias: why.append("Numerology: "+nbias+" (context only)")
+    if fut.get("buildup"): why.append("Futures: "+str(fut.get("buildup")))
     result={"status":"PARTIAL" if partial else "OK","symbol":s,"technical":tech,"futures":fut,"options":oc,
-        "futures_options":combine_futures_options(fut,oc),"astrology":ast,"numerology":num,
+        "futures_options":combine_futures_options(fut,oc),"astrology":ast,"numerology":num,"trade_plan":trade_plan,
         "sentiment":{"status":"OK","bias":sentiment,"technical":tech.get("direction"),"options":oc.get("signal"),"futures":fut.get("buildup")},
-        "decision":{"action":decision,"strength":min(100,50+abs(bullish-bearish)*15),"agreement":"CONFIRMED" if (bullish>=2 or bearish>=2) else "NO AGREEMENT"},
+        "decision":{"action":decision,"strength":strength,"score":round(combined_score,1),"agreement":"CONFIRMED" if len(components)>=2 and abs(combined_score)>=20 else "NO AGREEMENT","reasons":why},
         "message":"Partial data: " + ", ".join(errors) if errors else None,"updated_at":time.time()}
     return safe(result)
 

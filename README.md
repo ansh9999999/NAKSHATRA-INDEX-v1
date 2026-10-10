@@ -1,33 +1,27 @@
-# NAKSHATRA INDEX v1
+# NAKSHATRA INDEX — restored dashboard build
 
-Lightweight Indian-index-only dashboard for Render free 512 MB instances.
+This build restores the premium dark/neon dashboard layout and the key v3.5-style sections while retaining the INDEX-only Kotak Neo backend.
 
-## Supported markets
-- NIFTY 50
-- BANKNIFTY
-- NIFTY IT
-- SENSEX
-
-## Design goals
-- No APScheduler inside the web process
-- No scanner background job
-- No crypto/commodity code
-- Bounded in-memory caches
-- Quote endpoint separated from heavy analysis
-- Single-flight background analysis per symbol
-- Option chain via Kotak Neo only in this build
+## Sections
+- Live market and multi-timeframe technical trends
+- AI final agreement and reasons
+- Futures × options cross-check and top-5 OI tables
+- ATR-based illustrative Trade Plan (entry, stop, T1/T2/T3, R:R) only when a directional signal and ATR are available
+- Astrology, Nakshatra/Moon/Tithi/Rahu context, numerology and sentiment
+- Scanner and explicit status panels for gamma, institutional flows, catalysts and trade journal/equity curve (these are not connected in this INDEX backend and are not fabricated)
 
 ## Render start command
 `uvicorn main:app --host 0.0.0.0 --port $PORT`
 
-## Required environment
-`KOTAK_CONSUMER_KEY`
-`KOTAK_ACCESS_TOKEN` (if using access-token auth)
-`KOTAK_MOBILE_NUMBER`
-`KOTAK_UCC`
-`KOTAK_MPIN`
-`KOTAK_TOTP_SECRET` (if unattended TOTP login is used)
-`KOTAK_ENVIRONMENT=prod`
-`KOTAK_NEO_FIN_KEY=neotradeapi`
+## Environment
+Configure the existing Kotak Neo credentials in Render Environment. Do not commit credentials.
 
-Do not enable a scheduler variable. This project intentionally has no scheduler.
+## Resource safeguards
+- Single-flight analysis by symbol
+- Limited thread pools
+- Cache TTLs and bounded top-level caches
+- Timed-out auxiliary calls are not repeatedly queued while an earlier call is still running
+- Dashboard polls quotes every 20 seconds and scanner every 120 seconds; analysis is polled only while loading
+
+## Important
+Render Free's 512 MB limit is a hard limit. Provider SDKs and pandas can still exceed it depending on the runtime and API responses; verify Render Events after deployment. A `Service recovered` event means the instance became healthy again, not that a memory issue has been permanently resolved.
